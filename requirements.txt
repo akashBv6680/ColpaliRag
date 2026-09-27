@@ -1,30 +1,24 @@
-# Core / UI
 streamlit
-
-# Gemini API
 google-genai
-
-# Vector store
-chromadb[hnsw]
+chromadb
 pysqlite3-binary
 
-# LangChain text splitters
-langchain-text-splitters
-langchain-core
-langsmith
-
-# Document loaders / parsers
-pypdf
-requests
+sentence-transformers
+torch
+numpy
 pandas
+
+langchain-text-splitters
+
+requests
 beautifulsoup4
 lxml
 
-# PDF to images
+pypdf
 PyMuPDF
+Pillow
 
-# TTS
 gtts
+edge-tts
 
-# Monitoring
 agentops
