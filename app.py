@@ -5,19 +5,19 @@
 # 2. RAG Chatbot
 # 3. TTS Demo (Standalone)
 #
-# Added:
-# - PDF page rendering to images
-# - Visual page descriptions created with Gemini
-# - Visual-description retrieval through ChromaDB
-# - Relevant PDF page image sent directly to Gemini for final answers
-#
-# Note:
-# This is a ColPali-inspired visual RAG implementation.
-# It does not run the original ColPali multi-vector model locally.
+# Features:
+# - Text RAG with ChromaDB + SentenceTransformer
+# - PDF page rendering with PyMuPDF
+# - Gemini visual page analysis for visual retrieval
+# - Relevant PDF page images sent to Gemini
+# - Persistent visual chat history after switching Streamlit modules
+# - CAG response cache
+# - Multilingual answer support
+# - Edge-TTS and gTTS voice support
+# - Optional AgentOps tracking
 
 import asyncio
 import base64
-import datetime
 import hashlib
 import io
 import os
@@ -25,15 +25,13 @@ import sys
 import tempfile
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import chromadb
 import fitz
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import torch
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -52,7 +50,7 @@ except ImportError:
 
 
 # -----------------------------------------------------------
-# Optional embedding model
+# Optional SentenceTransformer import
 # -----------------------------------------------------------
 
 try:
@@ -62,7 +60,7 @@ except ImportError:
 
 
 # -----------------------------------------------------------
-# Gemini SDK
+# Gemini SDK import
 # -----------------------------------------------------------
 
 try:
@@ -76,7 +74,7 @@ except ImportError:
 
 
 # -----------------------------------------------------------
-# Optional Text-to-Speech engines
+# Optional TTS imports
 # -----------------------------------------------------------
 
 try:
@@ -91,7 +89,7 @@ except Exception:
 
 
 # -----------------------------------------------------------
-# Streamlit page configuration
+# Streamlit configuration
 # -----------------------------------------------------------
 
 st.set_page_config(
@@ -102,7 +100,7 @@ st.set_page_config(
 
 
 # -----------------------------------------------------------
-# Application configuration
+# App constants
 # -----------------------------------------------------------
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -166,7 +164,7 @@ if not st.session_state.agentops_initialized:
 
 
 # -----------------------------------------------------------
-# Cached application resources
+# Cached dependencies
 # -----------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
@@ -203,7 +201,7 @@ def initialize_gemini_client():
 
 
 # -----------------------------------------------------------
-# ChromaDB functions
+# ChromaDB helpers
 # -----------------------------------------------------------
 
 def get_collection():
@@ -220,7 +218,9 @@ def get_collection():
     try:
         return st.session_state.db_client.get_or_create_collection(
             name=COLLECTION_NAME,
-            metadata={"description": "Text and visual page retrieval for RAG"},
+            metadata={
+                "description": "Text and visual PDF-page retrieval for RAG"
+            },
         )
     except Exception as error:
         st.error(f"Error accessing ChromaDB: {error}")
@@ -244,7 +244,7 @@ def create_embeddings(texts: List[str]) -> List[List[float]]:
     if model is None:
         raise RuntimeError(
             "SentenceTransformer is unavailable. "
-            "Check that sentence-transformers is in requirements.txt."
+            "Check requirements.txt for sentence-transformers."
         )
 
     vectors = model.encode(
@@ -298,7 +298,7 @@ def store_records(
 
 def retrieve_records(
     query: str,
-    n_results: int = DEFAULT_RETRIEVAL_COUNT,
+    n_results: int,
 ) -> List[Dict[str, Any]]:
     collection = get_collection()
 
@@ -306,29 +306,33 @@ def retrieve_records(
         return []
 
     query_embedding = create_embeddings([query])[0]
-    result_count = min(n_results, collection.count())
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=result_count,
+        n_results=min(n_results, collection.count()),
         include=["documents", "metadatas", "distances"],
     )
-
-    records = []
 
     documents = results.get("documents", [[]])[0]
     metadatas = results.get("metadatas", [[]])[0]
     distances = results.get("distances", [[]])[0]
 
-    for index, document in enumerate(documents):
-        metadata = metadatas[index] if index < len(metadatas) else {}
-        distance = distances[index] if index < len(distances) else None
+    records = []
 
+    for index, document in enumerate(documents):
         records.append(
             {
                 "document": document,
-                "metadata": metadata,
-                "distance": distance,
+                "metadata": (
+                    metadatas[index]
+                    if index < len(metadatas)
+                    else {}
+                ),
+                "distance": (
+                    distances[index]
+                    if index < len(distances)
+                    else None
+                ),
             }
         )
 
@@ -336,32 +340,33 @@ def retrieve_records(
 
 
 # -----------------------------------------------------------
-# PDF and document extraction
+# Document and PDF helpers
 # -----------------------------------------------------------
 
 def create_document_id(file_name: str, file_bytes: bytes) -> str:
     file_hash = hashlib.sha256(file_bytes).hexdigest()[:20]
-    clean_name = "".join(
+
+    safe_name = "".join(
         character if character.isalnum() else "_"
         for character in file_name
     )
 
-    return f"{clean_name}_{file_hash}"
+    return f"{safe_name}_{file_hash}"
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    extracted_pages = []
+    text_parts = []
 
     with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf_document:
         for page_number, page in enumerate(pdf_document, start=1):
             page_text = page.get_text("text").strip()
 
             if page_text:
-                extracted_pages.append(
+                text_parts.append(
                     f"[PDF Page {page_number}]\n{page_text}"
                 )
 
-    return "\n\n".join(extracted_pages)
+    return "\n\n".join(text_parts)
 
 
 def render_pdf_pages(
@@ -369,7 +374,7 @@ def render_pdf_pages(
     max_pages: int,
     zoom: float = 1.7,
 ) -> List[Tuple[int, bytes]]:
-    page_images: List[Tuple[int, bytes]] = []
+    output = []
 
     with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf_document:
         page_limit = min(pdf_document.page_count, max_pages)
@@ -382,19 +387,17 @@ def render_pdf_pages(
                 alpha=False,
             )
 
-            page_images.append(
+            output.append(
                 (
                     page_index + 1,
                     pixmap.tobytes("png"),
                 )
             )
 
-    return page_images
+    return output
 
 
-def extract_text_from_upload(
-    uploaded_file,
-) -> Tuple[str, bool]:
+def extract_text_from_upload(uploaded_file) -> Tuple[str, bool]:
     file_name = uploaded_file.name.lower()
     file_type = uploaded_file.type or ""
     raw_bytes = uploaded_file.getvalue()
@@ -420,24 +423,19 @@ def extract_text_from_upload(
         return f"Error reading file: {error}", False
 
 
-# -----------------------------------------------------------
-# URL ingestion
-# -----------------------------------------------------------
-
 def load_text_from_url(url: str) -> Tuple[str, bool]:
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(compatible; ColPaliVisualRAG/1.0)"
-            )
-        }
-
         response = requests.get(
             url,
-            headers=headers,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; ColPaliVisualRAG/1.0)"
+                )
+            },
             timeout=20,
         )
+
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, "lxml")
@@ -468,13 +466,6 @@ def analyze_pdf_page_with_gemini(
     page_number: int,
     file_name: str,
 ) -> str:
-    """
-    Produces a searchable visual description of one PDF page.
-
-    This description is embedded in ChromaDB. The real page PNG is
-    stored separately in session state and can be returned at query time.
-    """
-
     gemini_client = initialize_gemini_client()
 
     if gemini_client is None or types is None:
@@ -484,21 +475,19 @@ def analyze_pdf_page_with_gemini(
         )
 
     prompt = f"""
-Analyze this PDF page for visual retrieval.
+Analyze this PDF page for visual document retrieval.
 
-File: {file_name}
-Page: {page_number}
+Document: {file_name}
+PDF page: {page_number}
 
-Describe all important visual and structural content in a retrieval-friendly format:
-- document title and section headings
-- tables: names, columns, rows, values, relationships
-- charts and graphs: chart type, axes, trends, key values
-- architecture diagrams: components, hierarchy, arrows, relationships
-- images, icons, labels, and callouts
-- page layout and key text visible in the visual
+Create a concise, searchable description of:
+- headings and visible text
+- tables, columns, rows, and numerical values
+- charts, axes, trends, and labels
+- diagrams, arrows, hierarchy, and component relationships
+- icons, callouts, and visual structure
 
-Do not invent information.
-Return concise but information-rich plain text that can later be used to retrieve this exact page.
+Do not invent content. Return only a useful retrieval description.
 """.strip()
 
     try:
@@ -522,34 +511,27 @@ Return concise but information-rich plain text that can later be used to retriev
 
     except Exception as error:
         return (
-            f"Visual-analysis fallback for PDF page {page_number}: "
-            f"Gemini analysis failed: {error}"
+            f"Visual analysis fallback for page {page_number}: "
+            f"{error}"
         )
 
     return f"PDF page {page_number} from {file_name}."
 
 
 # -----------------------------------------------------------
-# Document ingestion: text + visual page index
+# Ingestion functions
 # -----------------------------------------------------------
 
 def process_pdf_for_visual_rag(
     uploaded_file,
     max_pages_to_render: int,
-) -> Tuple[int, int, str]:
-    """
-    Ingests:
-    1. Text chunks for classic RAG.
-    2. Visual page descriptions for image/page retrieval.
-    3. Original page PNG bytes stored in session state.
-    """
-
+) -> Tuple[int, int]:
     file_bytes = uploaded_file.getvalue()
     file_name = uploaded_file.name
     document_id = create_document_id(file_name, file_bytes)
 
-    raw_text = extract_text_from_pdf(file_bytes)
-    text_chunks = split_documents(raw_text)
+    pdf_text = extract_text_from_pdf(file_bytes)
+    text_chunks = split_documents(pdf_text)
 
     text_metadatas = [
         {
@@ -566,18 +548,18 @@ def process_pdf_for_visual_rag(
         metadatas=text_metadatas,
     )
 
-    page_images = render_pdf_pages(
+    rendered_pages = render_pdf_pages(
         pdf_bytes=file_bytes,
         max_pages=max_pages_to_render,
     )
 
-    visual_documents = []
-    visual_metadatas = []
-
     if document_id not in st.session_state.page_images:
         st.session_state.page_images[document_id] = {}
 
-    for page_number, image_bytes in page_images:
+    visual_documents = []
+    visual_metadatas = []
+
+    for page_number, image_bytes in rendered_pages:
         st.session_state.page_images[document_id][page_number] = image_bytes
 
         visual_description = analyze_pdf_page_with_gemini(
@@ -586,14 +568,13 @@ def process_pdf_for_visual_rag(
             file_name=file_name,
         )
 
-        visual_record = (
+        visual_documents.append(
             f"VISUAL PAGE DESCRIPTION\n"
             f"File: {file_name}\n"
-            f"Page Number: {page_number}\n\n"
+            f"PDF Page: {page_number}\n\n"
             f"{visual_description}"
         )
 
-        visual_documents.append(visual_record)
         visual_metadatas.append(
             {
                 "source_name": file_name,
@@ -608,12 +589,10 @@ def process_pdf_for_visual_rag(
         metadatas=visual_metadatas,
     )
 
-    return text_count, visual_count, document_id
+    return text_count, visual_count
 
 
-def process_text_document(
-    uploaded_file,
-) -> Tuple[int, str]:
+def process_text_document(uploaded_file) -> int:
     file_name = uploaded_file.name
     file_bytes = uploaded_file.getvalue()
     document_id = create_document_id(file_name, file_bytes)
@@ -623,7 +602,7 @@ def process_text_document(
     if not success:
         raise RuntimeError(raw_text)
 
-    text_chunks = split_documents(raw_text)
+    chunks = split_documents(raw_text)
 
     metadatas = [
         {
@@ -632,15 +611,13 @@ def process_text_document(
             "record_type": "text",
             "page_number": 0,
         }
-        for _ in text_chunks
+        for _ in chunks
     ]
 
-    count = store_records(
-        documents=text_chunks,
+    return store_records(
+        documents=chunks,
         metadatas=metadatas,
     )
-
-    return count, document_id
 
 
 def process_url_document(url: str) -> int:
@@ -672,20 +649,15 @@ def process_url_document(url: str) -> int:
 
 
 # -----------------------------------------------------------
-# Visual-image retrieval
+# Retrieval and visual-page lookup
 # -----------------------------------------------------------
 
 def get_retrieved_page_images(
     retrieved_records: List[Dict[str, Any]],
     maximum_images: int,
 ) -> List[Dict[str, Any]]:
-    """
-    Finds visual_page records from Chroma retrieval results,
-    then loads their matching original PNG images.
-    """
-
     selected_images = []
-    already_selected = set()
+    selected_keys = set()
 
     for record in retrieved_records:
         metadata = record.get("metadata", {})
@@ -697,9 +669,9 @@ def get_retrieved_page_images(
         page_number = metadata.get("page_number")
         source_name = metadata.get("source_name", "Unknown file")
 
-        page_key = (document_id, page_number)
+        key = (document_id, page_number)
 
-        if page_key in already_selected:
+        if key in selected_keys:
             continue
 
         image_bytes = (
@@ -712,14 +684,13 @@ def get_retrieved_page_images(
             selected_images.append(
                 {
                     "image_bytes": image_bytes,
-                    "document_id": document_id,
-                    "page_number": page_number,
                     "source_name": source_name,
-                    "visual_description": record.get("document", ""),
+                    "page_number": page_number,
+                    "document_id": document_id,
                 }
             )
 
-            already_selected.add(page_key)
+            selected_keys.add(key)
 
         if len(selected_images) >= maximum_images:
             break
@@ -730,35 +701,29 @@ def get_retrieved_page_images(
 def build_text_context(
     retrieved_records: List[Dict[str, Any]],
 ) -> str:
+    if not retrieved_records:
+        return "No relevant content was retrieved."
+
     context_parts = []
 
     for index, record in enumerate(retrieved_records, start=1):
         metadata = record.get("metadata", {})
-        record_type = metadata.get("record_type", "text")
+
         source_name = metadata.get("source_name", "Unknown")
+        record_type = metadata.get("record_type", "text")
         page_number = metadata.get("page_number", 0)
 
-        if record_type == "visual_page":
-            label = (
-                f"Visual page description from {source_name}, "
-                f"page {page_number}"
-            )
-        else:
-            label = f"Text context from {source_name}"
-
         context_parts.append(
-            f"[Source {index}: {label}]\n"
+            f"[Source {index} | File: {source_name} | "
+            f"Type: {record_type} | PDF page: {page_number}]\n"
             f"{record.get('document', '')}"
         )
-
-    if not context_parts:
-        return "No relevant documents were retrieved."
 
     return "\n\n---\n\n".join(context_parts)
 
 
 # -----------------------------------------------------------
-# Gemini response generation with retrieved images
+# Gemini visual RAG answer generation
 # -----------------------------------------------------------
 
 def call_gemini_visual_rag(
@@ -766,7 +731,6 @@ def call_gemini_visual_rag(
     text_context: str,
     retrieved_images: List[Dict[str, Any]],
     selected_language: str,
-    max_retries: int = 3,
 ) -> Dict[str, str]:
     gemini_client = initialize_gemini_client()
 
@@ -779,21 +743,20 @@ def call_gemini_visual_rag(
         }
 
     system_instruction = f"""
-You are an expert multimodal RAG assistant.
+You are an accurate multimodal RAG assistant.
 
-Use only the supplied text context and the retrieved document page images to answer the user question.
+Use only the retrieved text context and any supplied PDF page images.
 
 Rules:
-1. Inspect images carefully for diagrams, charts, tables, labels, arrows, and visual relationships.
-2. Use the visual page only when it is relevant to the question.
-3. Do not invent data that is absent from the retrieved context or images.
-4. If the answer is not supported, clearly say that.
-5. Cite the source file and PDF page number when possible.
-6. Respond clearly and accurately in {selected_language}.
+- Analyze diagrams, charts, tables, labels, and visual relationships carefully.
+- Do not invent facts not present in the supplied sources.
+- Mention the source file and PDF page number whenever possible.
+- If the evidence is insufficient, state that clearly.
+- Reply in {selected_language}.
 """.strip()
 
     prompt = f"""
-RETRIEVED DOCUMENT CONTEXT:
+RETRIEVED CONTEXT:
 {text_context}
 
 USER QUESTION:
@@ -802,74 +765,61 @@ USER QUESTION:
 
     contents: List[Any] = [prompt]
 
-    for retrieved_image in retrieved_images:
-        source_name = retrieved_image["source_name"]
-        page_number = retrieved_image["page_number"]
-
+    for image_data in retrieved_images:
         contents.append(
-            f"Retrieved visual source: {source_name}, PDF page {page_number}."
+            f"Retrieved visual source: "
+            f"{image_data['source_name']}, "
+            f"PDF page {image_data['page_number']}."
         )
 
         contents.append(
             types.Part.from_bytes(
-                data=retrieved_image["image_bytes"],
+                data=image_data["image_bytes"],
                 mime_type="image/png",
             )
         )
 
-    retry_delay = 1
-
-    for attempt in range(max_retries):
-        try:
-            config = types.GenerateContentConfig(
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
                 top_p=0.8,
                 max_output_tokens=2048,
-            )
+            ),
+        )
 
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=config,
-            )
+        if response.text:
+            return {"response": response.text.strip()}
 
-            response_text = getattr(response, "text", None)
+        return {"error": "Gemini returned an empty response."}
 
-            if response_text:
-                return {"response": response_text.strip()}
+    except APIError as error:
+        return {"error": str(error)}
 
-            return {"error": "Gemini returned an empty response."}
-
-        except APIError as error:
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                return {"error": str(error)}
-
-        except Exception as error:
-            return {"error": str(error)}
-
-    return {"error": "Gemini request failed after retries."}
+    except Exception as error:
+        return {"error": str(error)}
 
 
 # -----------------------------------------------------------
-# CAG-enhanced RAG pipeline
+# CAG cache and RAG pipeline
 # -----------------------------------------------------------
 
 def create_cache_key(
     query: str,
     selected_language: str,
-    max_visual_images: int,
+    retrieval_count: int,
+    maximum_visual_images: int,
 ) -> str:
-    source = (
-        f"{query}|{selected_language}|"
-        f"{max_visual_images}|{GEMINI_MODEL}"
+    raw_key = (
+        f"{query}|{selected_language}|{retrieval_count}|"
+        f"{maximum_visual_images}|{GEMINI_MODEL}"
     )
 
     return hashlib.sha256(
-        source.encode("utf-8")
+        raw_key.encode("utf-8")
     ).hexdigest()
 
 
@@ -878,11 +828,17 @@ def rag_pipeline(
     selected_language: str,
     retrieval_count: int,
     maximum_visual_images: int,
-) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+) -> Tuple[
+    str,
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    bool,
+]:
     cache_key = create_cache_key(
         query=query,
         selected_language=selected_language,
-        max_visual_images=maximum_visual_images,
+        retrieval_count=retrieval_count,
+        maximum_visual_images=maximum_visual_images,
     )
 
     cache = st.session_state.cache
@@ -892,12 +848,12 @@ def rag_pipeline(
         and time.time() - cache[cache_key]["timestamp"]
         < CACHE_EXPIRY_SECONDS
     ):
-        cached = cache[cache_key]
+        cached_result = cache[cache_key]
 
         return (
-            cached["answer"],
-            cached["retrieved_records"],
-            cached["retrieved_images"],
+            cached_result["answer"],
+            cached_result["retrieved_records"],
+            cached_result["retrieved_images"],
             True,
         )
 
@@ -906,27 +862,26 @@ def rag_pipeline(
         n_results=retrieval_count,
     )
 
-    text_context = build_text_context(retrieved_records)
-
     retrieved_images = get_retrieved_page_images(
         retrieved_records=retrieved_records,
         maximum_images=maximum_visual_images,
     )
 
-    response_json = call_gemini_visual_rag(
+    text_context = build_text_context(
+        retrieved_records=retrieved_records,
+    )
+
+    response = call_gemini_visual_rag(
         query=query,
         text_context=text_context,
         retrieved_images=retrieved_images,
         selected_language=selected_language,
     )
 
-    if "error" in response_json:
-        answer = f"Generation error: {response_json['error']}"
-    else:
-        answer = response_json.get(
-            "response",
-            "No response text.",
-        )
+    answer = response.get(
+        "response",
+        f"Generation error: {response.get('error', 'Unknown error')}",
+    )
 
     st.session_state.cache[cache_key] = {
         "answer": answer,
@@ -935,17 +890,21 @@ def rag_pipeline(
         "retrieved_images": retrieved_images,
     }
 
-    return answer, retrieved_records, retrieved_images, False
+    return (
+        answer,
+        retrieved_records,
+        retrieved_images,
+        False,
+    )
 
 
 # -----------------------------------------------------------
-# Text-to-speech utilities
+# TTS functions
 # -----------------------------------------------------------
 
 async def edge_tts_async(
     text: str,
     voice: str,
-    rate: str = "+0%",
 ):
     if edge_tts is None:
         return None
@@ -953,49 +912,40 @@ async def edge_tts_async(
     communication = edge_tts.Communicate(
         text=text,
         voice=voice,
-        rate=rate,
+        rate="+0%",
     )
 
-    audio_buffer = io.BytesIO()
+    output = io.BytesIO()
 
     async for chunk in communication.stream():
         if chunk["type"] == "audio":
-            audio_buffer.write(chunk["data"])
+            output.write(chunk["data"])
 
-    return audio_buffer.getvalue()
+    return output.getvalue()
 
 
-def tts_edge(
-    text: str,
-    voice: str = "en-US-AriaNeural",
-):
+def tts_edge(text: str, voice: str):
     try:
         return asyncio.run(
-            edge_tts_async(
-                text=text,
-                voice=voice,
-            )
+            edge_tts_async(text=text, voice=voice)
         ), None
     except Exception as error:
         return None, str(error)
 
 
-def tts_gtts(
-    text: str,
-    language_code: str = "en",
-):
+def tts_gtts(text: str, language_code: str):
     if gTTS is None:
         return None, "gTTS is not available."
 
     try:
-        audio_buffer = io.BytesIO()
+        buffer = io.BytesIO()
 
         gTTS(
             text=text,
             lang=language_code,
-        ).write_to_fp(audio_buffer)
+        ).write_to_fp(buffer)
 
-        return audio_buffer.getvalue(), None
+        return buffer.getvalue(), None
 
     except Exception as error:
         return None, str(error)
@@ -1006,7 +956,7 @@ def synthesize(
     engine: str,
     language_code: str,
 ):
-    edge_voice_map = {
+    voice_map = {
         "en": "en-US-AriaNeural",
         "hi": "hi-IN-SwaraNeural",
         "ta": "ta-IN-PallaviNeural",
@@ -1016,7 +966,6 @@ def synthesize(
         "de": "de-DE-KatjaNeural",
         "ar": "ar-SA-ZariyahNeural",
         "zh-Hans": "zh-CN-XiaoxiaoNeural",
-        "zh-cn": "zh-CN-XiaoxiaoNeural",
         "ja": "ja-JP-NanamiNeural",
         "ko": "ko-KR-SunHiNeural",
         "pt": "pt-PT-RaquelNeural",
@@ -1027,14 +976,14 @@ def synthesize(
     }
 
     if engine == "Edge-TTS":
-        selected_voice = edge_voice_map.get(
+        voice = voice_map.get(
             language_code,
             "en-US-AriaNeural",
         )
 
         audio, error = tts_edge(
             text=text,
-            voice=selected_voice,
+            voice=voice,
         )
 
         if audio:
@@ -1063,10 +1012,108 @@ def synthesize(
 
 
 # -----------------------------------------------------------
-# Clear storage
+# Persistent visual chat rendering
 # -----------------------------------------------------------
 
-def clear_rag_storage():
+def render_visual_pages(
+    retrieved_images: List[Dict[str, Any]],
+) -> None:
+    if not retrieved_images:
+        return
+
+    st.markdown("#### Retrieved Visual Pages Sent to Gemini")
+
+    image_columns = st.columns(
+        min(2, len(retrieved_images))
+    )
+
+    for image_index, image_data in enumerate(retrieved_images):
+        with image_columns[image_index % len(image_columns)]:
+            st.image(
+                image_data["image_bytes"],
+                caption=(
+                    f"{image_data['source_name']} — "
+                    f"PDF page {image_data['page_number']}"
+                ),
+                use_container_width=True,
+            )
+
+
+def render_retrieval_details(
+    retrieved_records: List[Dict[str, Any]],
+) -> None:
+    if not retrieved_records:
+        return
+
+    with st.expander("View retrieved text and visual descriptions"):
+        for index, record in enumerate(
+            retrieved_records,
+            start=1,
+        ):
+            metadata = record.get("metadata", {})
+
+            st.markdown(
+                f"**{index}. {metadata.get('source_name', 'Unknown')}** "
+                f"| Type: `{metadata.get('record_type', 'text')}` "
+                f"| Page: `{metadata.get('page_number', 0)}`"
+            )
+
+            st.caption(
+                record.get("document", "")[:1200]
+            )
+
+
+def render_chat_history() -> None:
+    """
+    Renders all past messages including persisted PDF images.
+
+    This runs every time the RAG Chatbot module is opened, so answers
+    and visual pages remain visible after switching modules.
+    """
+
+    for message in st.session_state.messages_rag:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+            if message.get("audio"):
+                st.audio(
+                    io.BytesIO(
+                        base64.b64decode(message["audio"])
+                    ),
+                    format="audio/mp3",
+                )
+
+            if message["role"] == "assistant":
+                render_visual_pages(
+                    message.get("retrieved_images", [])
+                )
+
+                render_retrieval_details(
+                    message.get("retrieved_records", [])
+                )
+
+                if message.get("response_time") is not None:
+                    st.caption(
+                        f"Generation time: "
+                        f"{message['response_time']:.2f} seconds | "
+                        f"Retrieved records: "
+                        f"{len(message.get('retrieved_records', []))} | "
+                        f"Retrieved PDF images: "
+                        f"{len(message.get('retrieved_images', []))}"
+                    )
+
+
+# -----------------------------------------------------------
+# Storage cleanup
+# -----------------------------------------------------------
+
+def clear_chat_and_visual_history() -> None:
+    st.session_state.messages_rag = []
+    st.session_state.cache = {}
+    st.rerun()
+
+
+def clear_rag_storage() -> None:
     if "db_client" not in st.session_state:
         (
             st.session_state.db_client,
@@ -1079,7 +1126,7 @@ def clear_rag_storage():
     if database_client:
         try:
             database_client.delete_collection(
-                name=COLLECTION_NAME,
+                name=COLLECTION_NAME
             )
         except Exception:
             pass
@@ -1113,12 +1160,15 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 AgentOps Monitoring")
 
 if tracker.is_initialized:
-    session_display = (
-        tracker.session_id[:8] + "..."
+    session_name = (
+        f"{tracker.session_id[:8]}..."
         if tracker.session_id
         else "active"
     )
-    st.sidebar.success(f"✅ AgentOps session: {session_display}")
+
+    st.sidebar.success(
+        f"✅ AgentOps session: {session_name}"
+    )
 
     dashboard_url = tracker.get_session_dashboard_url()
 
@@ -1142,9 +1192,9 @@ if "db_client" not in st.session_state:
     ) = initialize_rag_dependencies()
 
 collection = get_collection()
-knowledge_base_count = collection.count() if collection else 0
+loaded_record_count = collection.count() if collection else 0
 
-st.sidebar.info(f"Loaded Records: {knowledge_base_count}")
+st.sidebar.info(f"Loaded Records: {loaded_record_count}")
 st.sidebar.info(
     f"Visual PDF Pages Indexed: "
     f"{st.session_state.visual_index_count}"
@@ -1152,6 +1202,12 @@ st.sidebar.info(
 st.sidebar.caption(
     f"CAG Cache Size: {len(st.session_state.cache)}"
 )
+
+if st.sidebar.button(
+    "Clear Chat & Visual History",
+    use_container_width=True,
+):
+    clear_chat_and_visual_history()
 
 if st.sidebar.button(
     "Clear RAG Storage & Cache",
@@ -1179,6 +1235,7 @@ language_display = st.sidebar.selectbox(
 )
 
 st.session_state.selected_language = language_display
+
 language_code = LANGUAGE_DICT.get(
     language_display,
     "en",
@@ -1197,21 +1254,19 @@ if menu == "Document Loader":
     )
 
     st.caption(
-        "For PDFs, the app extracts text chunks and renders pages as images. "
-        "Gemini generates a searchable description for each page. "
-        "At question time, the relevant PDF page image is retrieved and "
-        "sent directly to Gemini."
+        "PDF uploads are indexed as both text chunks and visual page "
+        "descriptions. Relevant page images are retrieved and sent to Gemini "
+        "when you ask visual questions."
     )
 
     st.warning(
-        "For diagrams, charts, tables, and visual architecture documents, "
-        "upload the document as a PDF. URL ingestion currently indexes text "
-        "only, because external webpages are not automatically screenshot."
+        "For tables, charts, diagrams, and image-heavy documentation, "
+        "upload a PDF. URL ingestion currently indexes text only."
     )
 
-    left_column, right_column = st.columns(2)
+    upload_column, url_column = st.columns(2)
 
-    with left_column:
+    with upload_column:
         st.subheader("Upload Files")
 
         max_pdf_pages = st.number_input(
@@ -1220,10 +1275,6 @@ if menu == "Document Loader":
             max_value=25,
             value=DEFAULT_PDF_PAGES_TO_PROCESS,
             step=1,
-            help=(
-                "Each page uses a Gemini visual-analysis request during "
-                "ingestion. Start with 5–10 pages to control API usage."
-            ),
         )
 
         uploaded_files = st.file_uploader(
@@ -1249,7 +1300,7 @@ if menu == "Document Loader":
                 total_visual_records = 0
 
                 with st.spinner(
-                    "Extracting text, rendering PDF pages, and indexing visuals..."
+                    "Extracting text, rendering PDF images, and indexing..."
                 ):
                     for uploaded_file in uploaded_files:
                         file_bytes = uploaded_file.getvalue()
@@ -1257,10 +1308,13 @@ if menu == "Document Loader":
                             file_bytes
                         ).hexdigest()
 
-                        if file_hash in st.session_state.processed_file_hashes:
+                        if (
+                            file_hash
+                            in st.session_state.processed_file_hashes
+                        ):
                             st.warning(
-                                f"Skipped: '{uploaded_file.name}' "
-                                "was already processed in this session."
+                                f"Skipped '{uploaded_file.name}': "
+                                "already processed in this session."
                             )
                             continue
 
@@ -1269,10 +1323,11 @@ if menu == "Document Loader":
                                 (
                                     text_count,
                                     visual_count,
-                                    _,
                                 ) = process_pdf_for_visual_rag(
                                     uploaded_file=uploaded_file,
-                                    max_pages_to_render=int(max_pdf_pages),
+                                    max_pages_to_render=int(
+                                        max_pdf_pages
+                                    ),
                                 )
 
                                 total_text_records += text_count
@@ -1285,29 +1340,31 @@ if menu == "Document Loader":
                                 st.success(
                                     f"Processed PDF: {uploaded_file.name} "
                                     f"— {text_count} text chunks and "
-                                    f"{visual_count} visual page records."
+                                    f"{visual_count} visual pages."
                                 )
 
                                 tracker.track_document_upload(
                                     filename=uploaded_file.name,
                                     file_size=len(file_bytes),
-                                    chunk_count=text_count + visual_count,
+                                    chunk_count=(
+                                        text_count + visual_count
+                                    ),
                                     extra={
+                                        "file_type": "pdf",
                                         "text_chunks": text_count,
                                         "visual_pages": visual_count,
-                                        "file_type": "pdf",
                                     },
                                 )
 
                             else:
-                                text_count, _ = process_text_document(
-                                    uploaded_file=uploaded_file,
+                                text_count = process_text_document(
+                                    uploaded_file=uploaded_file
                                 )
 
                                 total_text_records += text_count
 
                                 st.success(
-                                    f"Processed: {uploaded_file.name} "
+                                    f"Processed {uploaded_file.name} "
                                     f"— {text_count} text chunks."
                                 )
 
@@ -1316,9 +1373,8 @@ if menu == "Document Loader":
                                     file_size=len(file_bytes),
                                     chunk_count=text_count,
                                     extra={
-                                        "text_chunks": text_count,
-                                        "visual_pages": 0,
                                         "file_type": "text",
+                                        "visual_pages": 0,
                                     },
                                 )
 
@@ -1332,8 +1388,8 @@ if menu == "Document Loader":
 
                         except Exception as error:
                             st.error(
-                                f"Failed to process "
-                                f"'{uploaded_file.name}': {error}"
+                                f"Failed to process {uploaded_file.name}: "
+                                f"{error}"
                             )
 
                             tracker.track_error(
@@ -1342,11 +1398,11 @@ if menu == "Document Loader":
                             )
 
                 st.success(
-                    f"Ingestion complete: {total_text_records} text records "
-                    f"and {total_visual_records} visual page records."
+                    f"Ingestion completed: {total_text_records} text "
+                    f"records and {total_visual_records} visual records."
                 )
 
-    with right_column:
+    with url_column:
         st.subheader("Load from URL 🌐")
 
         url_input = st.text_input(
@@ -1355,9 +1411,8 @@ if menu == "Document Loader":
         )
 
         st.info(
-            "URL ingestion currently performs text retrieval. "
-            "For direct visual-page retrieval, download visual documents "
-            "as PDF and upload them in the left panel."
+            "URLs are indexed as text. For direct image retrieval, "
+            "download visual documents as PDF and upload them."
         )
 
         if st.button(
@@ -1367,12 +1422,10 @@ if menu == "Document Loader":
             if not url_input.strip():
                 st.warning("Enter a valid URL first.")
             else:
-                with st.spinner(
-                    f"Fetching and indexing: {url_input.strip()}"
-                ):
+                with st.spinner("Fetching and indexing URL..."):
                     try:
-                        added_records = process_url_document(
-                            url=url_input.strip(),
+                        count = process_url_document(
+                            url_input.strip()
                         )
 
                         st.session_state.ingested_files.append(
@@ -1380,13 +1433,13 @@ if menu == "Document Loader":
                         )
 
                         st.success(
-                            f"Ingested {added_records} text chunks from URL."
+                            f"Ingested {count} text chunks from the URL."
                         )
 
                         tracker.track_document_upload(
                             filename=url_input.strip(),
                             file_size=0,
-                            chunk_count=added_records,
+                            chunk_count=count,
                             extra={
                                 "file_type": "url",
                                 "visual_pages": 0,
@@ -1394,7 +1447,9 @@ if menu == "Document Loader":
                         )
 
                     except Exception as error:
-                        st.error(f"URL ingestion failed: {error}")
+                        st.error(
+                            f"URL ingestion failed: {error}"
+                        )
 
                         tracker.track_error(
                             operation="url_ingestion",
@@ -1407,9 +1462,7 @@ if menu == "Document Loader":
     if st.session_state.ingested_files:
         st.json(st.session_state.ingested_files)
     else:
-        st.info(
-            "No files or URLs have been loaded into the RAG system."
-        )
+        st.info("No files or URLs have been loaded yet.")
 
 
 # -----------------------------------------------------------
@@ -1419,11 +1472,11 @@ if menu == "Document Loader":
 elif menu == "RAG Chatbot":
     st.title("RAG AI Agent 🧠")
     st.markdown(
-        "### Text Retrieval + Visual PDF Page Retrieval"
+        "### Text Retrieval + Persistent Visual PDF Page Retrieval"
     )
 
     st.caption(
-        f"**Status:** Loaded Records: {knowledge_base_count} | "
+        f"Loaded Records: {loaded_record_count} | "
         f"Visual Pages: {st.session_state.visual_index_count} | "
         f"Language: {st.session_state.selected_language} | "
         f"Mode: {response_mode} ({tts_engine})"
@@ -1431,13 +1484,13 @@ elif menu == "RAG Chatbot":
 
     if not GEMINI_API_KEY:
         st.error(
-            "Set GEMINI_API_KEY in Streamlit secrets before using the chatbot."
+            "Set GEMINI_API_KEY in Streamlit secrets to use the chatbot."
         )
         st.stop()
 
-    retrieval_column, visual_column = st.columns(2)
+    setting_column_1, setting_column_2 = st.columns(2)
 
-    with retrieval_column:
+    with setting_column_1:
         retrieval_count = st.slider(
             "Records to retrieve",
             min_value=1,
@@ -1445,9 +1498,9 @@ elif menu == "RAG Chatbot":
             value=DEFAULT_RETRIEVAL_COUNT,
         )
 
-    with visual_column:
+    with setting_column_2:
         maximum_visual_images = st.slider(
-            "Maximum retrieved PDF page images for Gemini",
+            "Maximum retrieved PDF images for Gemini",
             min_value=0,
             max_value=6,
             value=DEFAULT_MAX_VISUAL_PAGES,
@@ -1458,36 +1511,28 @@ elif menu == "RAG Chatbot":
             {
                 "role": "assistant",
                 "content": (
-                    "Hello! Upload documents in the Document Loader module. "
-                    "For visual questions about diagrams, tables, or charts, "
-                    "upload a PDF and ask your question here."
+                    "Hello! Upload a document through Document Loader. "
+                    "For diagrams, tables, charts, and other visuals, upload "
+                    "a PDF and ask a question here."
                 ),
             }
         ]
 
-    for message in st.session_state.messages_rag:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-
-            if message.get("audio"):
-                st.audio(
-                    io.BytesIO(
-                        base64.b64decode(message["audio"])
-                    ),
-                    format="audio/mp3",
-                )
+    # This renders text, retrieved source details, and actual page images
+    # every time the user returns to RAG Chatbot.
+    render_chat_history()
 
     user_question = st.chat_input(
         "Ask a question about your documents..."
     )
 
     if user_question:
-        st.session_state.messages_rag.append(
-            {
-                "role": "user",
-                "content": user_question,
-            }
-        )
+        user_message = {
+            "role": "user",
+            "content": user_question,
+        }
+
+        st.session_state.messages_rag.append(user_message)
 
         with st.chat_message("user"):
             st.write(user_question)
@@ -1496,15 +1541,15 @@ elif menu == "RAG Chatbot":
             audio = None
 
             with st.spinner(
-                "Retrieving text and relevant visual PDF pages..."
+                "Retrieving text and relevant PDF page visuals..."
             ):
-                start_time = time.time()
+                started_at = time.time()
 
                 (
                     answer,
                     retrieved_records,
                     retrieved_images,
-                    served_from_cache,
+                    cache_hit,
                 ) = rag_pipeline(
                     query=user_question,
                     selected_language=st.session_state.selected_language,
@@ -1514,12 +1559,11 @@ elif menu == "RAG Chatbot":
                     ),
                 )
 
-                response_time = time.time() - start_time
+                response_time = time.time() - started_at
 
-                if served_from_cache:
+                if cache_hit:
                     st.info(
-                        "🔄 Serving response from cache "
-                        "(CAG / cost reduction)."
+                        "🔄 Serving response from CAG cache."
                     )
 
                 tracker.track_rag_query(
@@ -1529,7 +1573,7 @@ elif menu == "RAG Chatbot":
                     response_time=response_time,
                     extra={
                         "model": GEMINI_MODEL,
-                        "cache_hit": served_from_cache,
+                        "cache_hit": cache_hit,
                     },
                 )
 
@@ -1541,78 +1585,21 @@ elif menu == "RAG Chatbot":
                     response_time=response_time,
                     extra={
                         "model": GEMINI_MODEL,
-                        "cache_hit": served_from_cache,
+                        "cache_hit": cache_hit,
                     },
                 )
 
                 st.write(answer)
 
+                render_visual_pages(retrieved_images)
+
+                render_retrieval_details(retrieved_records)
+
                 st.caption(
                     f"Generation time: {response_time:.2f} seconds | "
-                    f"Retrieved text/visual records: "
-                    f"{len(retrieved_records)} | "
+                    f"Retrieved records: {len(retrieved_records)} | "
                     f"Retrieved PDF images: {len(retrieved_images)}"
                 )
-
-                if retrieved_images:
-                    st.markdown(
-                        "#### Retrieved Visual Pages Sent to Gemini"
-                    )
-
-                    image_columns = st.columns(
-                        min(2, len(retrieved_images))
-                    )
-
-                    for image_index, image_data in enumerate(
-                        retrieved_images
-                    ):
-                        with image_columns[
-                            image_index % len(image_columns)
-                        ]:
-                            st.image(
-                                image_data["image_bytes"],
-                                caption=(
-                                    f"{image_data['source_name']} "
-                                    f"— PDF page "
-                                    f"{image_data['page_number']}"
-                                ),
-                                use_container_width=True,
-                            )
-
-                if retrieved_records:
-                    with st.expander(
-                        "View retrieved text and visual descriptions"
-                    ):
-                        for record_index, record in enumerate(
-                            retrieved_records,
-                            start=1,
-                        ):
-                            metadata = record.get("metadata", {})
-
-                            source_name = metadata.get(
-                                "source_name",
-                                "Unknown",
-                            )
-
-                            record_type = metadata.get(
-                                "record_type",
-                                "text",
-                            )
-
-                            page_number = metadata.get(
-                                "page_number",
-                                0,
-                            )
-
-                            st.markdown(
-                                f"**{record_index}. {source_name}** "
-                                f"| Type: `{record_type}` "
-                                f"| Page: `{page_number}`"
-                            )
-
-                            st.caption(
-                                record.get("document", "")[:1200]
-                            )
 
                 if response_mode == "Voice":
                     with st.spinner("Synthesizing speech..."):
@@ -1630,7 +1617,9 @@ elif menu == "RAG Chatbot":
 
                             tracker.track_tts_generation(
                                 text=answer,
-                                language=st.session_state.selected_language,
+                                language=(
+                                    st.session_state.selected_language
+                                ),
                                 engine=tts_engine,
                                 audio_duration=0.0,
                             )
@@ -1639,9 +1628,15 @@ elif menu == "RAG Chatbot":
                                 f"TTS failed: {tts_error}"
                             )
 
+            # Critical fix:
+            # Save answer AND its retrieved image bytes + retrieval details.
+            # Therefore the visuals still appear after changing modules.
             assistant_message = {
                 "role": "assistant",
                 "content": answer,
+                "retrieved_images": retrieved_images,
+                "retrieved_records": retrieved_records,
+                "response_time": response_time,
             }
 
             if audio:
@@ -1662,14 +1657,14 @@ elif menu == "TTS Demo (Standalone)":
     st.title("Text-to-Speech Demo 🔊")
 
     st.info(
-        "Uses the selected TTS engine and language from the sidebar."
+        "Uses the current TTS engine and language selected in the sidebar."
     )
 
     tts_text = st.text_area(
         "Text to convert to speech",
         (
             "This is a demonstration of the multilingual "
-            "text-to-speech capabilities of the RAG application."
+            "text-to-speech capabilities of the RAG AI Agent."
         ),
         height=150,
     )
@@ -1700,7 +1695,9 @@ elif menu == "TTS Demo (Standalone)":
 
                     tracker.track_tts_generation(
                         text=tts_text,
-                        language=st.session_state.selected_language,
+                        language=(
+                            st.session_state.selected_language
+                        ),
                         engine=tts_engine,
                         audio_duration=0.0,
                     )
