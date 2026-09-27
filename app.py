@@ -1,7 +1,6 @@
 import os
 import time
 import hashlib
-import asyncio
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -26,15 +25,10 @@ from google import genai
 from google.genai import types
 
 # TTS
-import nest_asyncio
 from gtts import gTTS
-from edge_tts import EdgeTTS
 
-# AgentOps tracker (you will drop agentops_config.py in the same repo)
+# AgentOps tracker
 from agentops_config import tracker
-
-# Allow async TTS inside Streamlit
-nest_asyncio.apply()
 
 # -----------------------------
 # Config & constants
@@ -85,7 +79,6 @@ def extract_text_from_file(uploaded_file) -> str:
         soup = BeautifulSoup(content, "lxml")
         return soup.get_text(separator="\n", strip=True)
     if name.endswith(".pdf"):
-        # We'll handle PDF separately for images; here just basic text
         return extract_text_from_pdf_bytes(content)
     return content.decode("utf-8", errors="ignore")
 
@@ -148,9 +141,8 @@ def add_document_to_chroma(
     metadata: Dict[str, Any]
 ):
     """
-    Split text into chunks and add to Chroma with basic text embeddings.
-    For now, we use a simple placeholder embedding (zeros) and rely on
-    Gemini for understanding; you can later plug in real embeddings.
+    Split text into chunks and add to Chroma.
+    Uses placeholder embeddings for now; retrieval is demo-level.
     """
     chunks = text_splitter.split_text(text)
     if not chunks:
@@ -162,8 +154,6 @@ def add_document_to_chroma(
 
     for i, chunk in enumerate(chunks):
         chunk_id = f"{doc_id}_chunk_{i}"
-        # Placeholder embedding: 1536-dim zero vector (just to satisfy schema)
-        # Later you can replace this with real embeddings (e.g., from an API).
         emb = [0.0] * 1536
         ids.append(chunk_id)
         embeddings.append(emb)
@@ -184,10 +174,8 @@ def add_document_to_chroma(
 def retrieve_chunks_for_query(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     """
     Retrieve chunks for a query.
-    Since we use placeholder embeddings, this is just a demo retrieval.
-    For a real system, plug in proper embeddings + similarity search.
+    Currently uses placeholder embeddings; replace with real embeddings later.
     """
-    # Placeholder query embedding
     query_emb = [0.0] * 1536
     results = collection.query(
         query_embeddings=[query_emb],
@@ -224,15 +212,9 @@ def ask_gemini_visual_rag(
         "Answer concisely and clearly. If the information is not in the context or images, say so."
     )
 
-    contents = []
+    contents = [prompt]
 
-    # Add text prompt
-    contents.append(prompt)
-
-    # Add images if available and requested
     if use_images and page_images:
-        # Gemini expects either a URL or inline bytes for images.
-        # Here we use inline bytes via types.Part.from_bytes for images.
         for png_bytes in page_images:
             image_part = types.Part.from_bytes(
                 data=png_bytes,
@@ -249,7 +231,6 @@ def ask_gemini_visual_rag(
         ),
     )
 
-    # Extract text from response
     answer = ""
     if response and response.candidates:
         candidate = response.candidates[0]
@@ -260,7 +241,7 @@ def ask_gemini_visual_rag(
     return answer.strip()
 
 # -----------------------------
-# TTS functions
+# TTS functions (gTTS only)
 # -----------------------------
 
 def text_to_speech_gtts(text: str, lang: str = "en") -> Optional[bytes]:
@@ -275,23 +256,6 @@ def text_to_speech_gtts(text: str, lang: str = "en") -> Optional[bytes]:
         return audio_bytes
     except Exception as e:
         st.warning(f"gTTS failed: {e}")
-        return None
-
-async def text_to_speech_edge(text: str, lang: str = "en-US") -> Optional[bytes]:
-    try:
-        tts = EdgeTTS()
-        # Choose a voice; you can customize
-        voice = "en-US-JennyNeural" if "en" in lang else "en-US-JennyNeural"
-        tts.set_voice(voice)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-            await tts.save(fp.name, text)
-            fp_path = fp.name
-        with open(fp_path, "rb") as f:
-            audio_bytes = f.read()
-        os.remove(fp_path)
-        return audio_bytes
-    except Exception as e:
-        st.warning(f"Edge TTS failed: {e}")
         return None
 
 # -----------------------------
@@ -347,11 +311,6 @@ with st.sidebar:
     st.header("Answer settings")
 
     enable_tts = st.checkbox("Enable text-to-speech for answers", value=True)
-    tts_engine = st.selectbox(
-        "TTS engine",
-        options=["gTTS", "Edge TTS"],
-        index=0
-    )
     tts_lang = st.text_input("TTS language code", value="en")
 
     st.divider()
@@ -371,25 +330,20 @@ if uploaded_files:
             tracker.track_document_upload(
                 filename=doc_name,
                 size=uploaded_file.size,
-                chunk_count=0  # we don't know yet; can be improved
+                chunk_count=0
             )
         except Exception:
             pass
 
         if doc_name.lower().endswith(".pdf"):
-            # Text
             pdf_bytes = uploaded_file.read()
             text_content = extract_text_from_pdf_bytes(pdf_bytes)
-
-            # Images
             page_images = render_pdf_to_images(pdf_bytes, max_pages=max_pdf_pages)
 
-            # Store images in session for later retrieval by doc_id
             if "pdf_images" not in st.session_state:
                 st.session_state.pdf_images = {}
             st.session_state.pdf_images[doc_id] = page_images
 
-            # Add text to Chroma
             add_document_to_chroma(
                 doc_id=doc_id,
                 text=text_content,
@@ -401,7 +355,6 @@ if uploaded_files:
                 }
             )
         else:
-            # Non-PDF: just text
             text_content = extract_text_from_file(uploaded_file)
             add_document_to_chroma(
                 doc_id=doc_id,
@@ -432,7 +385,7 @@ if url_input:
             }
         )
         st.sidebar.success("URL ingested successfully.")
-        url_input = ""  # clear input
+        url_input = ""
     except Exception as e:
         st.sidebar.error(f"Failed to ingest URL: {e}")
 
@@ -447,25 +400,20 @@ for msg in st.session_state.messages:
 user_query = st.chat_input("Ask anything about your documents...")
 
 if user_query:
-    # Add user message
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.markdown(user_query)
 
-    # Retrieve chunks
     retrieved_chunks = retrieve_chunks_for_query(user_query, top_k=5)
 
-    # Collect relevant page images (from all docs for simplicity; can be refined)
     page_images_to_send = None
     if use_images_in_answer and "pdf_images" in st.session_state:
         all_images = []
         for doc_id, imgs in st.session_state.pdf_images.items():
             all_images.extend(imgs)
-        # Limit number of images sent to Gemini to control cost
         max_images_to_send = 5
         page_images_to_send = all_images[:max_images_to_send]
 
-    # Prepare cache key
     context_ids = "|".join(
         [f"{c['metadata'].get('doc_id')}_{c['metadata'].get('chunk_index')}" for c in retrieved_chunks]
     )
@@ -489,11 +437,12 @@ if user_query:
 
                 response_time = time.time() - start_time
 
-                # Track query
+                # Track as visual RAG query
                 try:
-                    tracker.track_rag_query(
+                    tracker.track_visual_rag_query(
                         query=user_query,
-                        retrieved_chunks=retrieved_chunks,
+                        num_chunks=len(retrieved_chunks),
+                        num_images=len(page_images_to_send) if page_images_to_send else 0,
                         answer_length=len(answer),
                         response_time=response_time
                     )
@@ -509,27 +458,21 @@ if user_query:
             # TTS
             if enable_tts and answer:
                 try:
-                    if tts_engine == "gTTS":
-                        audio_bytes = text_to_speech_gtts(answer, lang=tts_lang)
-                    else:
-                        audio_bytes = asyncio.run(
-                            text_to_speech_edge(answer, lang=tts_lang or "en-US")
-                        )
+                    audio_bytes = text_to_speech_gtts(answer, lang=tts_lang or "en")
                     if audio_bytes:
                         st.audio(audio_bytes, format="audio/mpeg", start_time=0)
                         try:
                             tracker.track_tts_generation(
                                 text_length=len(answer),
                                 language=tts_lang or "en",
-                                engine=tts_engine,
-                                audio_duration=0  # approximate if needed
+                                engine="gTTS",
+                                audio_duration=0
                             )
                         except Exception:
                             pass
                 except Exception as e:
                     st.warning(f"TTS error: {e}")
     else:
-        # Use cached answer
         with st.chat_message("assistant"):
             st.markdown(f"*[cached]* {answer}")
         st.session_state.messages.append({"role": "assistant", "content": f"[cached] {answer}"})
