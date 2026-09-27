@@ -1,164 +1,146 @@
-import time
-from typing import Any, Dict, List, Optional
-
 import streamlit as st
-
-try:
-    import agentops
-    AGENTOPS_AVAILABLE = True
-except Exception:
-    AGENTOPS_AVAILABLE = False
+from datetime import datetime
 
 
 class RAGAgentOpsTracker:
     """
-    Tracker for RAG operations using AgentOps.
-    Supports:
-      - document_upload
-      - rag_query
-      - visual_rag_query (for ColPali-style calls with images)
-      - tts_generation
-      - error events
+    Safe operation tracker for the RAG application.
+
+    Important:
+    - Keeps local operation data in self.operations.
+    - Initializes AgentOps when an API key is available.
+    - Does not call agentops.record(), because the installed AgentOps
+      version has a different record() signature and caused:
+      'record() takes 1 positional argument but 2 were given'.
     """
 
     def __init__(self):
-        self.initialized = False
-        self.session_id: Optional[str] = None
-        self.operations: List[Dict[str, Any]] = []
+        self.session_id = None
+        self.is_initialized = False
+        self.operations = []
+        self.agentops = None
 
-        if not AGENTOPS_AVAILABLE:
-            st.warning("AgentOps package not available; monitoring will be disabled.")
-            return
-
-        api_key = st.secrets.get("AGENTOPS_API_KEY", None)
-        if not api_key:
-            st.warning("AGENTOPS_API_KEY not found in secrets; AgentOps will not record events.")
-            return
+    def initialize(self):
+        if self.is_initialized:
+            return True
 
         try:
-            agentops.init(
-                api_key=api_key,
-                tags=["colpali-rag", "gemini", "visual-rag"],
-            )
-            self.initialized = True
-            # Store session id if available
-            self.session_id = getattr(agentops, "session_id", None)
-        except Exception as e:
-            st.warning(f"Failed to initialize AgentOps: {e}")
-            self.initialized = False
+            import agentops
 
-    def _record(self, event_name: str, data: Dict[str, Any]):
-        if not self.initialized:
-            return
-        try:
-            agentops.record(event_name, data)
-            self.operations.append({"event": event_name, "data": data, "timestamp": time.time()})
-        except Exception as e:
-            st.warning(f"Failed to record AgentOps event '{event_name}': {e}")
+            api_key = st.secrets.get("AGENTOPS_API_KEY")
 
-    def track_document_upload(
-        self,
-        filename: str,
-        size: int,
-        chunk_count: int,
-        extra: Optional[Dict[str, Any]] = None
-    ):
-        data = {
-            "filename": filename,
-            "size_bytes": size,
-            "chunk_count": chunk_count,
+            if not api_key:
+                return False
+
+            session = agentops.init(api_key=api_key)
+
+            self.agentops = agentops
+            self.is_initialized = True
+
+            if hasattr(session, "session_id"):
+                self.session_id = str(session.session_id)
+            elif hasattr(agentops, "session_id"):
+                self.session_id = str(agentops.session_id)
+            else:
+                self.session_id = None
+
+            return True
+
+        except Exception as error:
+            print(f"AgentOps initialization warning: {error}")
+            self.is_initialized = False
+            return False
+
+    def _save_operation(self, operation_name, data):
+        operation = {
+            "operation": operation_name,
+            "timestamp": datetime.now().isoformat(),
+            "status": "completed",
+            **data,
         }
+
+        self.operations.append(operation)
+
+    def track_document_upload(self, filename, file_size, chunk_count, extra=None):
+        data = {
+            "file_name": filename,
+            "file_size_bytes": file_size,
+            "chunks_created": chunk_count,
+        }
+
         if extra:
             data.update(extra)
-        self._record("document_upload", data)
 
-    def track_rag_query(
-        self,
-        query: str,
-        retrieved_chunks: List[Dict[str, Any]],
-        answer_length: int,
-        response_time: float,
-        extra: Optional[Dict[str, Any]] = None
-    ):
+        self._save_operation("document_upload", data)
+
+    def track_rag_query(self, query, retrieved_chunks, answer, response_time, extra=None):
         data = {
             "query": query,
-            "num_chunks": len(retrieved_chunks),
-            "answer_length": answer_length,
-            "response_time_sec": response_time,
+            "retrieved_chunks": retrieved_chunks,
+            "response_time_seconds": round(response_time, 2),
+            "answer_length": len(answer),
         }
+
         if extra:
             data.update(extra)
-        self._record("rag_query", data)
+
+        self._save_operation("rag_query", data)
 
     def track_visual_rag_query(
         self,
-        query: str,
-        num_chunks: int,
-        num_images: int,
-        answer_length: int,
-        response_time: float,
-        extra: Optional[Dict[str, Any]] = None
+        query,
+        retrieved_chunks,
+        retrieved_images,
+        answer,
+        response_time,
+        extra=None,
     ):
-        """
-        Specialized tracking for ColPali-style visual RAG calls
-        where page images are sent to Gemini along with text context.
-        """
         data = {
             "query": query,
-            "num_chunks": num_chunks,
-            "num_images": num_images,
-            "answer_length": answer_length,
-            "response_time_sec": response_time,
+            "retrieved_chunks": retrieved_chunks,
+            "retrieved_images": retrieved_images,
+            "response_time_seconds": round(response_time, 2),
+            "answer_length": len(answer),
         }
+
         if extra:
             data.update(extra)
-        self._record("visual_rag_query", data)
 
-    def track_tts_generation(
-        self,
-        text_length: int,
-        language: str,
-        engine: str,
-        audio_duration: float,
-        extra: Optional[Dict[str, Any]] = None
-    ):
-        data = {
-            "text_length": text_length,
-            "language": language,
-            "engine": engine,
-            "audio_duration_sec": audio_duration,
-        }
-        if extra:
-            data.update(extra)
-        self._record("tts_generation", data)
+        self._save_operation("visual_rag_query", data)
 
-    def track_error(
-        self,
-        operation: str,
-        error_message: str,
-        extra: Optional[Dict[str, Any]] = None
-    ):
-        data = {
-            "operation": operation,
-            "error_message": error_message,
-        }
-        if extra:
-            data.update(extra)
-        self._record("error", data)
+    def track_tts_generation(self, text, language, engine, audio_duration):
+        self._save_operation(
+            "tts_generation",
+            {
+                "text_length": len(text),
+                "language": language,
+                "tts_engine": engine,
+                "audio_duration_seconds": audio_duration,
+            },
+        )
 
-    def get_session_dashboard_url(self) -> Optional[str]:
-        if not self.initialized or not self.session_id:
-            return None
-        return f"https://app.agentops.ai/sessions/{self.session_id}"
+    def track_error(self, operation, error_message):
+        self.operations.append(
+            {
+                "operation": operation,
+                "timestamp": datetime.now().isoformat(),
+                "error": error_message,
+                "status": "failed",
+            }
+        )
+
+    def get_session_dashboard_url(self):
+        if self.session_id:
+            return f"https://app.agentops.ai/sessions/{self.session_id}"
+
+        return None
 
     def end_session(self):
-        if not self.initialized:
-            return
         try:
-            agentops.end_session()
-        except Exception:
-            pass
+            if self.is_initialized and self.agentops:
+                self.agentops.end_session()
+        except Exception as error:
+            print(f"AgentOps end-session warning: {error}")
 
 
-# Global tracker instance
 tracker = RAGAgentOpsTracker()
